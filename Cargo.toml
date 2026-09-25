@@ -150,6 +150,13 @@ serde_path_to_error = "0.1"
 # Default features only: serde and serde_json, with no simulator and no BPF
 # build anywhere in the graph.
 scxsim-workload-ir = "0.1.0"
+# The simulator itself, for the opt-in `scxsim` feature. It must be a normal
+# dependency of THIS package: build.rs builds the scheduler `.so` from inputs
+# scx_simulator publishes through its `links = "scxsim"` key, and Cargo hands
+# those (`DEP_SCXSIM_*`) only to direct `[dependencies]` dependents.
+# `default-features = false` drops the bundled-`.so` constructors; build.rs
+# builds the one scheduler this package loads.
+scx_simulator = { version = "1.0.0", default-features = false, optional = true }
 toml = { version = "1.1", optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -494,6 +501,13 @@ pretty-labels = ["dep:grex"]
 # transparently skip the remote path. Pulls in `opendal` + a
 # minimal `tokio` runtime; saves both transitive trees on local dev.
 remote-cache = ["dep:opendal", "dep:tokio"]
+# Run a scenario on scx_simulator IN-PROCESS: the typed export record is
+# lowered by scxsim-workload-ir (`ingest` adds `to_scenario`) and simulated in
+# the calling binary, with no exported file and no simulator binary between
+# them. Off by default. build.rs compiles the `simple` scheduler `.so` with
+# clang, which the default BPF skeleton build already requires.
+# `tests/scxsim_in_process.rs` is both the proof and the worked example.
+scxsim = ["dep:scx_simulator", "dep:scxsim-build", "scxsim-workload-ir/ingest"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_nightly)'] }
@@ -565,6 +579,10 @@ sha2 = "0.11"
 # the dep graph narrow and pins one algorithm across every hashing
 # site in the project. See build.rs `siphash_13` for the call site.
 siphasher = "1"
+# Optional with `scxsim`: builds the scheduler `.so` the in-process test
+# loads, and supplies the host link arguments scx_simulator's load-time probe
+# checks for. See build.rs `scxsim_main`.
+scxsim-build = { version = "0.1.0", optional = true }
 tar = "0.4"
 
 [[bin]]
@@ -620,6 +638,12 @@ name = "verifier_pipeline"
 
 [[test]]
 name = "compile_fail"
+
+# Loads the scheduler `.so` build.rs compiles only under `scxsim`, and
+# `env!`s its directory.
+[[test]]
+name = "scxsim_in_process"
+required-features = ["scxsim"]
 
 [[test]]
 name = "jemalloc_probe_tests"

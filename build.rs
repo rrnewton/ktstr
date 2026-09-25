@@ -43,6 +43,9 @@ fn main() {
     println!("cargo:rerun-if-changed=build_support/gix_acquire.rs");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
+    #[cfg(feature = "scxsim")]
+    scxsim_main(&out_dir);
+
     // docs.rs / non-`vendored` builds cannot compile the vendored libbpf
     // C stack (the docs.rs sandbox has no flex/bison) or fetch build-time
     // blobs (no network), and without `vendored` there is no libbpf-cargo
@@ -57,6 +60,37 @@ fn main() {
     emit_docsrs_stubs(&out_dir);
     #[cfg(feature = "vendored")]
     vendored_main(out_dir);
+}
+
+/// The `scxsim` feature's build side: compile the scheduler `.so` that
+/// `tests/scxsim_in_process.rs` loads, and give that test the host link
+/// arguments.
+///
+/// The `.so` resolves 55 simulator symbols from the binary that `dlopen`s it,
+/// and scx_simulator refuses the load (`LoadError::HostSymbolsNotExported`)
+/// when the binary does not export them: most would otherwise bind silently to
+/// the `.so`'s own fallbacks or to NULL. The arguments are scoped to `[[test]]`
+/// targets. `scxsim_build::emit_host_link_args()` applies them to every target,
+/// which would pull the simulator into the shipped `ktstr` / `cargo-ktstr`
+/// binaries, and those never load a scheduler. Cargo does not propagate link
+/// arguments to dependents, so a package that depends on ktstr and loads a
+/// scheduler must emit them from its own build script.
+#[cfg(feature = "scxsim")]
+fn scxsim_main(out_dir: &std::path::Path) {
+    for arg in scxsim_build::host_link_args() {
+        println!("cargo:rustc-link-arg-tests={arg}");
+    }
+    let simple: Vec<_> = scxsim_build::standalone_definitions()
+        .into_iter()
+        .filter(|d| d.name == "simple")
+        .collect();
+    assert_eq!(simple.len(), 1, "scxsim-build has no `simple` definition");
+    let so_dir = scxsim_build::SimBuildInputs::from_dep_env().build_bundled(
+        &simple,
+        &out_dir.join("scxsim"),
+        &scxsim_build::KernelConfig::default(),
+    );
+    println!("cargo:rustc-env=KTSTR_SCXSIM_SO_DIR={}", so_dir.display());
 }
 
 /// Emit the `$OUT_DIR` artifacts the crate `include!`s / `env!`s so
