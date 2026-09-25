@@ -1,17 +1,23 @@
 //! Host-side tests for the scenario export record.
 //!
-//! These pin the record's *shape*. Whether that shape is the one
-//! `scxsim-workload-ir` accepts is not knowable from inside ktstr and is not
-//! asserted here — the consumer deserialises with the real `SourceScenario`
-//! type, so a mismatch fails loudly there rather than passing quietly here.
+//! These pin the record's *serialised shape* — what an out-of-process consumer
+//! of an exported file reads — by asserting on its JSON. The record is now the
+//! `scxsim-workload-ir` type itself, so whether the simulator side accepts it is
+//! no longer a question for the consumer: the tests at the bottom run the real
+//! lowering on it, in-process.
 
 use std::time::Duration;
 
-use super::export_scenario;
+use super::{Export, export_scenario};
 use crate::scenario::ScenarioDef;
 use crate::scenario::ops::{CgroupDef, CpusetSpec, HoldSpec, Setup, Step};
 use crate::test_support::Topology;
 use crate::workload::{WorkSpec, WorkType};
+
+/// The record as the JSON an exported file carries.
+fn json(out: &Export) -> serde_json::Value {
+    serde_json::to_value(&out.record).expect("record serialises")
+}
 
 fn topo() -> Topology {
     Topology {
@@ -39,7 +45,7 @@ fn exports_the_basic_proportional_shape() {
     );
     assert!(out.is_complete(), "unexpected gaps: {:#?}", out.gaps);
 
-    let r = &out.record;
+    let r = &json(&out);
     assert_eq!(r["name"], "sched_basic_proportional");
     assert_eq!(r["topology"]["llcs"], 1);
     assert_eq!(r["topology"]["cores"], 2);
@@ -79,7 +85,7 @@ fn cpuset_stays_symbolic() {
     ]);
     let out = export_scenario("t", &def, &topo(), Duration::from_secs(1), 2);
     assert!(out.is_complete(), "gaps: {:#?}", out.gaps);
-    let cs = &out.record["steps"][0]["setup"][0]["cpuset"];
+    let cs = &json(&out)["steps"][0]["setup"][0]["cpuset"];
     assert_eq!(cs["disjoint"]["index"], 0);
     assert_eq!(cs["disjoint"]["of"], 2);
 }
@@ -94,7 +100,8 @@ fn per_step_holds_are_preserved() {
         Step::with_defs(vec![CgroupDef::named("cg_1")], HoldSpec::frac(0.5)),
     ]);
     let out = export_scenario("t", &def, &topo(), Duration::from_secs(10), 2);
-    let steps = out.record["steps"].as_array().unwrap();
+    let r = json(&out);
+    let steps = r["steps"].as_array().unwrap();
     assert_eq!(steps.len(), 2);
     assert_eq!(steps[0]["hold"]["frac"], 0.5);
     assert_eq!(steps[1]["hold"]["frac"], 0.5);
@@ -108,7 +115,7 @@ fn fixed_hold_exports_nanoseconds() {
         HoldSpec::fixed(Duration::from_millis(250)),
     )]);
     let out = export_scenario("t", &def, &topo(), Duration::from_secs(1), 1);
-    assert_eq!(out.record["steps"][0]["hold"]["fixed"], 250_000_000u64);
+    assert_eq!(json(&out)["steps"][0]["hold"]["fixed"], 250_000_000u64);
 }
 
 /// An unmapped work type is a RECORDED GAP, not a substitution. This is the
@@ -137,9 +144,8 @@ fn unmapped_work_type_is_a_gap_not_a_substitution() {
         "the gap must name the construct: {:#?}",
         out.gaps,
     );
-    let works = out.record["steps"][0]["setup"][0]["works"]
-        .as_array()
-        .unwrap();
+    let r = json(&out);
+    let works = r["steps"][0]["setup"][0]["works"].as_array().unwrap();
     assert!(
         works.is_empty(),
         "the unmapped work must be ABSENT, not replaced with a plausible \
@@ -166,7 +172,7 @@ fn factory_setup_is_a_gap() {
     assert!(!out.is_complete());
     assert!(out.gaps.iter().any(|g| g.construct == "Setup::Factory"));
     assert!(
-        out.record["steps"][0]["setup"]
+        json(&out)["steps"][0]["setup"]
             .as_array()
             .unwrap()
             .is_empty()
@@ -197,11 +203,12 @@ fn nice_is_carried_rather_than_nulled() {
         CgroupDef::named("cg_0").work(WorkSpec::default().work_type(WorkType::SpinWait).nice(-5)),
     ]);
     let out = export_scenario("nice", &def, &topo(), Duration::from_secs(1), 1);
-    let works = &out.record["steps"][0]["setup"][0]["works"][0];
+    let r = json(&out);
+    let works = &r["steps"][0]["setup"][0]["works"][0];
     assert_eq!(
         works["nice"], -5,
         "nice must reach the record; got {:#?}",
-        out.record["steps"][0]["setup"][0]
+        r["steps"][0]["setup"][0]
     );
     assert!(out.is_complete(), "unexpected gaps: {:#?}", out.gaps);
 }
@@ -259,7 +266,8 @@ fn fieldless_work_types_are_mapped() {
         ]);
         let out = export_scenario("wt", &def, &topo(), Duration::from_secs(1), 1);
         assert_eq!(
-            out.record["steps"][0]["setup"][0]["works"][0]["work_type"], expected,
+            json(&out)["steps"][0]["setup"][0]["works"][0]["work_type"],
+            expected,
             "WorkType::{wt:?} must export as {expected:?}"
         );
         assert!(
@@ -268,4 +276,85 @@ fn fieldless_work_types_are_mapped() {
             out.gaps
         );
     }
+}
+
+/// An exported file reads back as the record it was written from. The export
+/// directory is the out-of-process path, so its JSON has to stay the type's own
+/// serde form rather than drift into something only this file understands.
+#[test]
+fn exported_json_reads_back_as_the_record() {
+    let def = ScenarioDef::new(vec![
+        Step::with_defs(
+            vec![CgroupDef::named("cg_0").cpuset(CpusetSpec::Disjoint { index: 0, of: 2 })],
+            HoldSpec::frac(0.5),
+        ),
+        Step::with_defs(
+            vec![CgroupDef::named("cg_1").work(WorkSpec::default().nice(3))],
+            HoldSpec::fixed(Duration::from_millis(250)),
+        ),
+    ]);
+    let out = export_scenario("round_trip", &def, &topo(), Duration::from_secs(2), 1);
+    assert!(out.is_complete(), "unexpected gaps: {:#?}", out.gaps);
+    let bytes = serde_json::to_vec_pretty(&out.record).expect("serialise");
+    let back: scxsim_workload_ir::SourceScenario =
+        serde_json::from_slice(&bytes).expect("an exported file must deserialise");
+    assert_eq!(back, out.record);
+}
+
+/// The simulator's lowering accepts what this file exports — asserted here, in
+/// ktstr, rather than discovered when the simulator side reads a file.
+///
+/// Each gap-free shape the tests above build goes through the real
+/// `scxsim_workload_ir::lower`, and every exported cgroup must come out of it
+/// with tasks.
+#[test]
+fn the_lowering_accepts_the_exported_record() {
+    let cases = [
+        ScenarioDef::with_defs(vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")]),
+        ScenarioDef::with_defs(vec![
+            CgroupDef::named("cg_0").cpuset(CpusetSpec::Disjoint { index: 0, of: 2 }),
+            CgroupDef::named("cg_1").cpuset(CpusetSpec::Disjoint { index: 1, of: 2 }),
+        ]),
+        ScenarioDef::new(vec![
+            Step::with_defs(vec![CgroupDef::named("cg_0")], HoldSpec::frac(0.5)),
+            Step::with_defs(vec![CgroupDef::named("cg_1")], HoldSpec::frac(0.5)),
+        ]),
+        ScenarioDef::with_defs(vec![CgroupDef::named("cg_0").work(
+            WorkSpec::default().work_type(WorkType::FutexPingPong { spin_iters: 1024 }),
+        )]),
+    ];
+    for def in cases {
+        let out = export_scenario("lowered", &def, &topo(), Duration::from_secs(1), 3);
+        assert!(out.is_complete(), "unexpected gaps: {:#?}", out.gaps);
+        let ir = scxsim_workload_ir::lower(&out.record)
+            .unwrap_or_else(|e| panic!("the lowering refused {:#?}: {e}", out.record));
+        for cg in out.record.steps.iter().flat_map(|s| &s.setup) {
+            assert!(
+                tasks_in(&ir, &cg.name) > 0,
+                "cgroup {} lowered to no tasks: {:#?}",
+                cg.name,
+                ir.tasks
+            );
+        }
+    }
+}
+
+/// `workers: None` stays symbolic in the record, and the lowering binds it to
+/// the record's `default_workers_per_cgroup` — the value the exporter stamps
+/// explicitly so the two backends cannot each inherit a different default.
+#[test]
+fn unset_workers_bind_the_recorded_default() {
+    let def = ScenarioDef::with_defs(vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")]);
+    let out = export_scenario("defaults", &def, &topo(), Duration::from_secs(1), 3);
+    let ir = scxsim_workload_ir::lower(&out.record).expect("lowers");
+    for cg in ["cg_0", "cg_1"] {
+        assert_eq!(tasks_in(&ir, cg), 3, "{cg}: {:#?}", ir.tasks);
+    }
+}
+
+fn tasks_in(ir: &scxsim_workload_ir::WorkloadIr, cgroup: &str) -> usize {
+    ir.tasks
+        .iter()
+        .filter(|t| t.cgroup.as_ref().is_some_and(|c| c.as_str() == cgroup))
+        .count()
 }

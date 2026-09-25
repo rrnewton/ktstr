@@ -3014,6 +3014,7 @@ dependencies = [
  "rmesg",
  "rpm",
  "rustix",
+ "scxsim-workload-ir",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -4817,6 +4818,14 @@ dependencies = [
  "tracing-subscriber",
  "version-compare",
  "walkdir",
+]
+
+[[package]]
+name = "scxsim-workload-ir"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

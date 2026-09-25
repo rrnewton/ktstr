@@ -144,6 +144,12 @@ rmesg = { version = "1", default-features = false, features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_path_to_error = "0.1"
+# The simulator's source vocabulary. `scenario::export` builds its record as
+# this crate's `SourceScenario`, so a shape drift between the two is a compile
+# error here rather than a deserialisation error on the simulator side.
+# Default features only: serde and serde_json, with no simulator and no BPF
+# build anywhere in the graph.
+scxsim-workload-ir = "0.1.0"
 toml = { version = "1.1", optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

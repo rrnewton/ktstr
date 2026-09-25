@@ -1,33 +1,41 @@
 //! Export a [`ScenarioDef`] as a backend-neutral workload record.
 //!
-//! [`ScenarioDef`] made a test's workload a value; this makes it a value that
-//! can leave the process. The record is the input to `scxsim-workload-ir`'s
-//! `SourceScenario`, which lowers to a restricted IR and is ingested by the
-//! simulator — so the same test definition can drive the VM backend and the
-//! simulator without being written twice.
+//! [`ScenarioDef`] made a test's workload a value; this makes it a value the
+//! simulator can take. The record is `scxsim-workload-ir`'s
+//! [`SourceScenario`] itself, which lowers to a restricted IR and is ingested
+//! by the simulator — so the same test definition can drive the VM backend and
+//! the simulator without being written twice.
 //!
-//! # Why JSON and not a Cargo dependency
+//! # Why the record is the IR crate's type and not JSON
 //!
-//! ktstr and scx-sim live in different repositories, and the dependency runs
-//! ktstr -> scx-sim, never the reverse. A path dependency between two checkouts
-//! would bake a host-specific path into a committed manifest. JSON is the seam
-//! two repos can share without either owning the other's build.
+//! This file used to assemble the record with `serde_json::json!`, matching
+//! `SourceScenario`'s serde form by hand, because ktstr had no way to name the
+//! type: it lived only in the sched-test repository, and a path dependency
+//! between two checkouts would bake a host-specific path into a committed
+//! manifest. JSON was the seam two repos could share without either owning the
+//! other's build, and a drift surfaced only when the simulator side
+//! deserialised a record and named the field.
 //!
-//! The schema is not maintained by agreement. It is `SourceScenario`'s serde
-//! representation, and the consumer deserialises with that exact type — so a
-//! drift here surfaces as a hard deserialisation error naming the field, not as
-//! a workload that silently means something else. That is the point: this file
-//! is allowed to be wrong, but it is not allowed to be wrong quietly.
+//! With `scxsim-workload-ir` an ordinary crates.io dependency, the record is
+//! built as the type and the drift moves to compile time, in this file. Its
+//! default features are serde and serde_json only — no simulator, no BPF build
+//! — so taking the type costs ktstr nothing it did not already link. The JSON
+//! written by `export_registered_scenarios` is still produced, now as the
+//! type's own serde form, for tools that consume records out of process.
 //!
 //! # What is deliberately not exported
 //!
 //! Anything the record cannot represent faithfully is omitted with a recorded
 //! reason rather than approximated here. Approximation is the *lowering's* job,
-//! where it is classified and reported (`FidelityReport` on the IR side, which
-//! is a type in a different crate in a different repository, hence no link); an
+//! where it is classified and reported in the
+//! [`FidelityReport`](scxsim_workload_ir::FidelityReport) the IR carries; an
 //! approximation invented at export time would be invisible to that machinery
 //! and would reach the simulator disguised as an exact reading of the test.
 
+use scxsim_workload_ir::{
+    DurationNs, SourceCgroupDef, SourceCpuset, SourceHold, SourceScenario, SourceStep,
+    SourceTopology, SourceWorkSpec, SourceWorkType,
+};
 use serde::Serialize;
 
 use crate::scenario::ScenarioDef;
@@ -53,8 +61,8 @@ pub struct ExportGap {
 /// The exported record plus everything it could not carry.
 #[derive(Debug, Clone)]
 pub struct Export {
-    /// `SourceScenario`-shaped JSON.
-    pub record: serde_json::Value,
+    /// The scenario in the simulator's source vocabulary.
+    pub record: SourceScenario,
     /// Constructs omitted from `record`, each with a reason.
     pub gaps: Vec<ExportGap>,
 }
@@ -67,34 +75,45 @@ impl Export {
     }
 }
 
-/// Nanoseconds, matching `scxsim_workload_ir::units::DurationNs`'s
-/// transparent-`u64` serde form.
-fn ns(d: std::time::Duration) -> serde_json::Value {
-    serde_json::json!(u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
-}
-
-/// ktstr's `CpusetSpec` -> `SourceCpuset`'s snake_case externally-tagged form.
+/// ktstr's `CpusetSpec` -> `SourceCpuset`.
 ///
-/// Returns `None` for variants the record has no counterpart for; the caller
-/// records a gap. Resolving one here (say, by flattening a topology-relative
-/// cpuset into an explicit CPU list) would bind the scenario to this host's
-/// topology, which is exactly the symbolic-ness the DSL exists to keep.
-fn cpuset(spec: &CpusetSpec) -> Option<serde_json::Value> {
-    use serde_json::json;
-    Some(match spec {
-        CpusetSpec::Llc(i) => json!({ "llc": i }),
-        CpusetSpec::Numa(i) => json!({ "numa": i }),
-        CpusetSpec::Disjoint { index, of } => json!({ "disjoint": { "index": index, "of": of } }),
+/// Returns why a variant cannot be carried, for the caller to record as a gap.
+/// Resolving one here instead (say, by flattening a topology-relative cpuset
+/// into an explicit CPU list) would bind the scenario to this host's topology,
+/// which is exactly the symbolic-ness the DSL exists to keep.
+fn cpuset(spec: &CpusetSpec) -> Result<SourceCpuset, &'static str> {
+    // ktstr indexes with usize and the record with u32. No topology comes near
+    // the difference, but an index that does not fit is reported rather than
+    // truncated into a different, plausible cpuset.
+    let n = |v: usize| {
+        u32::try_from(v).map_err(|_| {
+            "an index or count outside u32, which the record cannot carry; \
+             truncating would silently name a different cpuset"
+        })
+    };
+    Ok(match spec {
+        CpusetSpec::Llc(i) => SourceCpuset::Llc(n(*i)?),
+        CpusetSpec::Numa(i) => SourceCpuset::Numa(n(*i)?),
+        CpusetSpec::Disjoint { index, of } => SourceCpuset::Disjoint {
+            index: n(*index)?,
+            of: n(*of)?,
+        },
         CpusetSpec::Range {
             start_frac,
             end_frac,
-        } => {
-            json!({ "range": { "start_frac": start_frac, "end_frac": end_frac } })
+        } => SourceCpuset::Range {
+            start_frac: *start_frac,
+            end_frac: *end_frac,
+        },
+        CpusetSpec::Overlap { index, of, frac } => SourceCpuset::Overlap {
+            index: n(*index)?,
+            of: n(*of)?,
+            frac: *frac,
+        },
+        _ => {
+            return Err("no SourceCpuset counterpart; resolving it here would \
+                        bind the scenario to this host's topology");
         }
-        CpusetSpec::Overlap { index, of, frac } => {
-            json!({ "overlap": { "index": index, "of": of, "frac": frac } })
-        }
-        _ => return None,
     })
 }
 
@@ -122,23 +141,22 @@ fn cpuset(spec: &CpusetSpec) -> Option<serde_json::Value> {
 /// remaining 34 want a per-variant mapping that translates the fields it can
 /// and records an [`ExportGap`] for the fields it cannot — worth doing, but it
 /// is a per-variant judgement each time, not a loop.
-fn work_type(wt: &WorkType) -> Option<serde_json::Value> {
-    use serde_json::json;
+fn work_type(wt: &WorkType) -> Option<SourceWorkType> {
     Some(match wt {
-        WorkType::SpinWait => json!("spin_wait"),
-        WorkType::YieldHeavy => json!("yield_heavy"),
-        WorkType::Mixed => json!("mixed"),
+        WorkType::SpinWait => SourceWorkType::SpinWait,
+        WorkType::YieldHeavy => SourceWorkType::YieldHeavy,
+        WorkType::Mixed => SourceWorkType::Mixed,
         // FIELDLESS variants, verbatim and only verbatim: each names the same
         // fieldless `SourceWorkType`, so nothing is rewritten here. What the
         // simulator cannot model about them -- for `IoSyncWrite`, the block
         // device, queue depth and byte counts -- is discarded one layer down by
         // the lowering, which records the cause when it does.
-        WorkType::IoSyncWrite => json!("io_sync_write"),
-        WorkType::IoRandRead => json!("io_rand_read"),
-        WorkType::IoConvoy => json!("io_convoy"),
-        WorkType::ForkExit => json!("fork_exit"),
-        WorkType::NiceSweep => json!("nice_sweep"),
-        WorkType::SmtSiblingSpin => json!("smt_sibling_spin"),
+        WorkType::IoSyncWrite => SourceWorkType::IoSyncWrite,
+        WorkType::IoRandRead => SourceWorkType::IoRandRead,
+        WorkType::IoConvoy => SourceWorkType::IoConvoy,
+        WorkType::ForkExit => SourceWorkType::ForkExit,
+        WorkType::NiceSweep => SourceWorkType::NiceSweep,
+        WorkType::SmtSiblingSpin => SourceWorkType::SmtSiblingSpin,
 
         // FIELD-CARRYING variants, mapped one at a time with their fields
         // checked against the IR rather than by name. Both of these carry a
@@ -147,18 +165,18 @@ fn work_type(wt: &WorkType) -> Option<serde_json::Value> {
         // meet before it belongs here. A variant whose ktstr fields have no IR
         // home must record an ExportGap instead; see the note above about
         // PriorityInversion::pi_mode and friends.
-        WorkType::FutexPingPong { spin_iters } => {
-            json!({ "futex_ping_pong": { "spin_iters": spin_iters } })
-        }
-        WorkType::CrossAffinityChurn { spin_iters } => {
-            json!({ "cross_affinity_churn": { "spin_iters": spin_iters } })
-        }
+        WorkType::FutexPingPong { spin_iters } => SourceWorkType::FutexPingPong {
+            spin_iters: *spin_iters,
+        },
+        WorkType::CrossAffinityChurn { spin_iters } => SourceWorkType::CrossAffinityChurn {
+            spin_iters: *spin_iters,
+        },
 
         _ => return None,
     })
 }
 
-fn work_spec(w: &WorkSpec, at: &str, gaps: &mut Vec<ExportGap>) -> Option<serde_json::Value> {
+fn work_spec(w: &WorkSpec, at: &str, gaps: &mut Vec<ExportGap>) -> Option<SourceWorkSpec> {
     let Some(wt) = work_type(&w.work_type) else {
         gaps.push(ExportGap {
             where_: at.to_string(),
@@ -180,9 +198,9 @@ fn work_spec(w: &WorkSpec, at: &str, gaps: &mut Vec<ExportGap>) -> Option<serde_
     // legal value fits, and an out-of-range one is recorded as a gap rather
     // than truncated into a different, plausible priority.
     let nice = match w.nice {
-        None => serde_json::Value::Null,
+        None => None,
         Some(n) => match i8::try_from(n) {
-            Ok(v) => serde_json::json!(v),
+            Ok(v) => Some(v),
             Err(_) => {
                 gaps.push(ExportGap {
                     where_: at.to_string(),
@@ -192,7 +210,7 @@ fn work_spec(w: &WorkSpec, at: &str, gaps: &mut Vec<ExportGap>) -> Option<serde_
                              substitute a different priority"
                         .to_string(),
                 });
-                serde_json::Value::Null
+                None
             }
         },
     };
@@ -214,27 +232,25 @@ fn work_spec(w: &WorkSpec, at: &str, gaps: &mut Vec<ExportGap>) -> Option<serde_
         });
     }
 
-    Some(serde_json::json!({
-        "workers": w.num_workers.map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
-        "work_type": wt,
-        "nice": nice,
-    }))
+    Some(SourceWorkSpec {
+        workers: w.num_workers.map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+        work_type: wt,
+        nice,
+    })
 }
 
-fn cgroup_def(def: &CgroupDef, at: &str, gaps: &mut Vec<ExportGap>) -> serde_json::Value {
+fn cgroup_def(def: &CgroupDef, at: &str, gaps: &mut Vec<ExportGap>) -> SourceCgroupDef {
     let cs = match &def.cpuset {
-        None => serde_json::Value::Null,
+        None => None,
         Some(spec) => match cpuset(spec) {
-            Some(v) => v,
-            None => {
+            Ok(c) => Some(c),
+            Err(reason) => {
                 gaps.push(ExportGap {
                     where_: at.to_string(),
                     construct: format!("CpusetSpec::{spec:?}"),
-                    reason: "no SourceCpuset counterpart; resolving it here would \
-                             bind the scenario to this host's topology"
-                        .to_string(),
+                    reason: reason.to_string(),
                 });
-                serde_json::Value::Null
+                None
             }
         },
     };
@@ -242,7 +258,7 @@ fn cgroup_def(def: &CgroupDef, at: &str, gaps: &mut Vec<ExportGap>) -> serde_jso
     // `works` empty means "one default WorkSpec", which is what the step runner
     // resolves it to (`merged_works`). Make that explicit in the record rather
     // than exporting an empty list the consumer would have to know to reinterpret.
-    let works: Vec<serde_json::Value> = if def.works.is_empty() {
+    let works: Vec<SourceWorkSpec> = if def.works.is_empty() {
         work_spec(&WorkSpec::default(), at, gaps)
             .into_iter()
             .collect()
@@ -263,26 +279,29 @@ fn cgroup_def(def: &CgroupDef, at: &str, gaps: &mut Vec<ExportGap>) -> serde_jso
         });
     }
 
-    serde_json::json!({
-        "name": def.name.as_ref(),
-        "cpuset": cs,
-        "works": works,
-        "cpu_quota": serde_json::Value::Null,
-        "cpu_weight": serde_json::Value::Null,
-    })
-}
-
-fn hold(h: &HoldSpec) -> serde_json::Value {
-    use serde_json::json;
-    match h {
-        HoldSpec::Frac(f) => json!({ "frac": f }),
-        HoldSpec::Fixed(d) => json!({ "fixed": ns(*d) }),
-        HoldSpec::Loop { interval } => json!({ "loop": { "interval": ns(*interval) } }),
+    SourceCgroupDef {
+        name: def.name.to_string(),
+        cpuset: cs,
+        works,
+        cpu_quota: None,
+        cpu_weight: None,
     }
 }
 
-fn step(s: &Step, idx: usize, gaps: &mut Vec<ExportGap>) -> serde_json::Value {
-    let setup: Vec<serde_json::Value> = match &s.setup {
+/// Durations become [`DurationNs`], which saturates at `u64::MAX` ns rather
+/// than wrapping; the record has always had that ceiling.
+fn hold(h: &HoldSpec) -> SourceHold {
+    match h {
+        HoldSpec::Frac(f) => SourceHold::Frac(*f),
+        HoldSpec::Fixed(d) => SourceHold::Fixed(DurationNs::from_std(*d)),
+        HoldSpec::Loop { interval } => SourceHold::Loop {
+            interval: DurationNs::from_std(*interval),
+        },
+    }
+}
+
+fn step(s: &Step, idx: usize, gaps: &mut Vec<ExportGap>) -> SourceStep {
+    let setup: Vec<SourceCgroupDef> = match &s.setup {
         Setup::Defs(defs) => defs
             .iter()
             .enumerate()
@@ -313,14 +332,14 @@ fn step(s: &Step, idx: usize, gaps: &mut Vec<ExportGap>) -> serde_json::Value {
         });
     }
 
-    serde_json::json!({
-        "setup": setup,
-        "ops": [],
-        "hold": hold(&s.hold),
-    })
+    SourceStep {
+        setup,
+        ops: Vec::new(),
+        hold: hold(&s.hold),
+    }
 }
 
-/// Export `def` as a `SourceScenario`-shaped record.
+/// Export `def` as a [`SourceScenario`].
 ///
 /// `topology` and `duration` come from the test's `#[ktstr_scenario]`
 /// attributes (via its `KtstrTestEntry`) rather than from the `ScenarioDef`,
@@ -339,7 +358,7 @@ pub fn export_scenario(
     default_workers_per_cgroup: u32,
 ) -> Export {
     let mut gaps = Vec::new();
-    let steps: Vec<serde_json::Value> = def
+    let steps: Vec<SourceStep> = def
         .steps()
         .iter()
         .enumerate()
@@ -357,18 +376,18 @@ pub fn export_scenario(
         });
     }
 
-    let record = serde_json::json!({
-        "name": name,
-        "topology": {
-            "numa_nodes": topology.numa_nodes,
-            "llcs": topology.llcs,
-            "cores": topology.cores_per_llc,
-            "threads": topology.threads_per_core,
+    let record = SourceScenario {
+        name: name.to_string(),
+        topology: SourceTopology {
+            numa_nodes: topology.numa_nodes,
+            llcs: topology.llcs,
+            cores: topology.cores_per_llc,
+            threads: topology.threads_per_core,
         },
-        "duration": ns(duration),
-        "steps": steps,
-        "default_workers_per_cgroup": default_workers_per_cgroup,
-    });
+        duration: DurationNs::from_std(duration),
+        steps,
+        default_workers_per_cgroup,
+    };
 
     Export { record, gaps }
 }
